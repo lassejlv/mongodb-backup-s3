@@ -1,12 +1,9 @@
 import mongoose from "mongoose";
 import fs from "fs";
 import path from "path";
-import { exec } from "child_process";
-import { promisify } from "util";
-import { s3, S3Client } from "bun";
+import { S3Client } from "bun";
 import { CronJob } from "cron";
-
-const execPromise = promisify(exec);
+import { createGzip } from "zlib";
 
 async function backupMongoDB(): Promise<string> {
   const dbHost = process.env.DB_HOST;
@@ -50,30 +47,74 @@ async function backupMongoDB(): Promise<string> {
 
     console.log(`Connected to database '${dbName}'. Starting backup...`);
 
-    const backupPath = path.join(backupDir, `${dbName}_${timestamp}`);
+    const backupFileName = `${dbName}_${timestamp}.json.gz`;
+    const backupFilePath = path.join(backupDir, backupFileName);
 
-    let authParams = "";
-    if (dbUser && dbPass) {
-      authParams = `-u "${dbUser}" -p "${dbPass}" --authenticationDatabase "${dbAuthSource}"`;
+    const gzip = createGzip();
+    const fileStream = fs.createWriteStream(backupFilePath);
+    gzip.pipe(fileStream);
+
+    const collections = await mongoose.connection.db?.collections()!;
+
+    gzip.write("[\n");
+
+    let isFirst = true;
+
+    for (const collection of collections) {
+      const collectionName = collection.collectionName;
+      console.log(`Backing up collection: ${collectionName}`);
+
+      // Get total count for this collection
+      const totalCount = await collection.countDocuments();
+      console.log(`Total documents in ${collectionName}: ${totalCount}`);
+
+      // Process in batches
+      const batchSize = 1000;
+      let processedCount = 0;
+
+      while (processedCount < totalCount) {
+        // Create a new cursor for each batch
+        const docs = await collection
+          .find({})
+          .skip(processedCount)
+          .limit(batchSize)
+          .toArray();
+
+        if (docs.length === 0) break;
+
+        for (const doc of docs) {
+          doc._collection = collectionName;
+
+          if (!isFirst) {
+            gzip.write(",\n");
+          } else {
+            isFirst = false;
+          }
+
+          gzip.write(JSON.stringify(doc));
+        }
+
+        processedCount += docs.length;
+        console.log(
+          `Processed ${processedCount}/${totalCount} documents from ${collectionName}`,
+        );
+      }
+
+      console.log(`Completed backup of collection: ${collectionName}`);
     }
 
-    const mongodumpCommand = `mongodump --host ${dbHost} --port ${dbPort} ${authParams} --db ${dbName} --out=${backupPath}`;
+    gzip.write("\n]");
+    gzip.end();
 
-    console.log("Executing mongodump...");
-    await execPromise(mongodumpCommand);
-
-    const tarFileName = `${dbName}_${timestamp}.tar.gz`;
-    const tarFilePath = path.join(backupDir, tarFileName);
-
-    console.log("Creating compressed archive...");
-    await execPromise(
-      `tar -czf ${tarFilePath} -C ${backupDir} ${path.basename(backupPath)}`,
-    );
-
-    fs.rmSync(backupPath, { recursive: true, force: true });
+    // Wait for everything to finish
+    await new Promise<void>((resolve) => {
+      fileStream.on("finish", () => {
+        resolve();
+      });
+    });
 
     console.log(`Backup completed successfully!`);
-    return tarFilePath;
+    return backupFilePath;
   } catch (error) {
     console.error("Backup operation failed:", error);
     throw error;
@@ -83,6 +124,8 @@ async function backupMongoDB(): Promise<string> {
 }
 
 async function uploadToS3(filePath: string): Promise<string> {
+  const s3 = new S3Client();
+
   const fileName = path.basename(filePath);
   const s3Key = `mongodb-backups/${fileName}`;
 
@@ -152,4 +195,4 @@ const job = new CronJob(cronSchedule, runBackup, null, true);
 console.log(
   `[${new Date().toISOString()}] MongoDB backup service started with schedule: ${cronSchedule}`,
 );
-console.log(`Next backup scheduled for: ${job.nextDate()}`);
+console.log(`Next backup scheduled for: ${job.nextDate().toLocaleString()}`);
