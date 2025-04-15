@@ -21,4 +21,4 @@ RUN mkdir -p backups
 
 ENV NODE_ENV=production
 
-ENTRYPOINT ["bun", "run", "index.ts"]
+ENTRYPOINT ["bun", "run", "src/index.ts"]
