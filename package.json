@@ -1,6 +1,9 @@
 {
   "name": "mongodb-backup-s3",
   "module": "src/index.ts",
+  "scripts": {
+    "build: "echo"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
